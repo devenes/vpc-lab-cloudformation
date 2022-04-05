@@ -1,0 +1,648 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Lab template
+Resources:
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 10.5.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Shared VPC
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 1267aae2-fb77-4f82-bbc9-b1786df576e3
+  SharedVPCRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Shared-VPC Route Table
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 4f2cdef7-bebc-4358-800e-ca8aec1f2052
+  PrivateSubnet1:
+    Type: "AWS::EC2::Subnet"
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.5.0.0/23
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: "AWS::Region"
+      Tags:
+        - Key: Name
+          Value: Shared VPC Subnet 1
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 2963d6db-c372-4bc8-91e5-f9b2a11df503
+  PrivateSubnet2:
+    Type: "AWS::EC2::Subnet"
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.5.2.0/23
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: "AWS::Region"
+      Tags:
+        - Key: Name
+          Value: Shared VPC Subnet 2
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 22d8c95a-501c-4037-a2bf-3bc6dbcd2ea7
+  PrivateRouteTableAssociation1:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    DependsOn:
+      - SharedVPCRouteTable
+      - PrivateSubnet1
+    Properties:
+      RouteTableId: !Ref SharedVPCRouteTable
+      SubnetId: !Ref PrivateSubnet1
+  PrivateRouteTableAssociation2:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    DependsOn:
+      - SharedVPCRouteTable
+      - PrivateSubnet2
+    Properties:
+      RouteTableId: !Ref SharedVPCRouteTable
+      SubnetId: !Ref PrivateSubnet2
+  AppInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AppRole
+      InstanceProfileName: Inventory-App-Role
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: aa9e7ebf-5639-42d3-acc2-e5bab4e26f44
+  AppRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: Inventory-App-Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: "ssm:*"
+                Resource: "arn:aws:ssm:*:*:parameter/inventory-app/*"
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: cc2fe389-6dc8-41cf-b6a3-6a304e00bce2
+  DBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: Lab DB Subnet Group
+      DBSubnetGroupName: Lab DB Subnet Group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: DBSubnetGroup
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 35b8d1b5-c8d7-4af8-b1a8-927cb0e2e4c6
+  DBSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    DependsOn: VPC
+    Properties:
+      GroupName: DB-SG
+      GroupDescription: Enable access to MySQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: DB-SG
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: dd878f45-1ad4-4a89-9299-978cd7b778c0
+  LambdaClearParameters:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: clears the parameter store
+      FunctionName: Clear-parameter-store
+      Role: !Sub "${LambdaVPCRole.Arn}"
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import threading
+          import cfnresponse
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          def handler(event, context):
+              # Send a failure to CloudFormation if the function timesout
+              timer = threading.Timer((context.get_remaining_time_in_millis()
+                      / 1000.00) - 0.5, timeout, args=[event, context])
+              timer.start()
+              
+              try:
+                  # Loop through regions
+                  ec2 = boto3.client('ec2')
+                  regions = ['us-east-1','us-west-2']
+                  for region in regions:
+
+                      # SSM Client
+                      ssm = boto3.client('ssm', region_name=region)
+
+                      # Get all Parameter Store parameters for region
+                      get_region_params = ssm.describe_parameters()
+                      names = [p['Name'] for p in get_region_params['Parameters']]
+                      print(region, names)
+
+                      # Delete them
+                      if len(names) > 0:
+                          del_region_params = ssm.delete_parameters(Names=names)
+                      else:
+                          print(('No parameters to delete in region ' + region))
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Resource creation successful!"}, None)
+              except:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": "Problem deleting parameters!"}, None)
+
+          def timeout(event, context):
+              logging.error("Execution is about to time out, sending failure response to CloudFormation")
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+      Handler: index.handler
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 300
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 964ce047-2ca1-42c1-8962-e2ea7438a7f0
+  CustomClearParameters:
+    Type: "Custom::CustomClearParameters"
+    Properties:
+      ServiceToken: !Sub "${LambdaClearParameters.Arn}"
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 59ba589b-9df9-42b2-bb47-336eee35ba37
+  LambdaVPCRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: SSMCleanup
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:*"
+                  - "ec2:Describe*"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 22b9f368-1e47-406f-980b-4392b7550951
+  IAMUser:
+    Type: "AWS::IAM::User"
+    Properties:
+      UserName: awsstudent
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: de807de2-3002-4667-9edc-bcc467cd4b8e
+  IAMPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    DependsOn: IAMUser
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: StudentPolicy
+            Action:
+              - "cloudformation:*"
+              - "cloud9:*"
+              - "iam:PassRole"
+              - "kms:List*"
+              - "cloudwatch:Describe*"
+              - "cloudwatch:Get*"
+              - "cloudwatch:List*"
+              - "rds:Delete*"
+              - "rds:*ParameterGroup"
+              - "rds:Describe*"
+              - "rds:PurchaseReservedDBInstancesOffering"
+              - "rds:*DBSubnetGroup"
+              - "rds:DownloadDBLogFilePortion"
+              - "rds:AddRoleToDBCluster"
+              - "rds:*Snapshot"
+              - "rds:*SecurityGroup*"
+              - "rds:CreateEventSubscription"
+              - "rds:FailoverDBCluster"
+              - "rds:AddRoleToDBInstance"
+              - "rds:*Tags*"
+              - "rds:ModifyEventSubscription"
+              - "rds:ApplyPendingMaintenanceAction"
+              - "rds:BacktrackDBCluster"
+              - "rds:Remove*"
+              - "rds:*OptionGroup"
+              - "rds:AddSourceIdentifierToSubscription"
+              - "rds:CreateDBClusterEndpoint"
+              - "rds:StopDBCluster"
+              - "rds:PromoteReadReplica"
+              - "rds:StopActivityStream"
+              - "rds:StartActivityStream"
+              - "rds:RestoreDBClusterToPointInTime"
+              - "rds:StopDBInstance"
+              - "rds:DownloadCompleteDBLogFile"
+              - "lambda:*"
+              - "ec2:*Address*"
+              - "ec2:Cancel*"
+              - "ec2:Describe*"
+              - "ec2:*Gateway"
+              - "ec2:Get*"
+              - "ec2:*Image*"
+              - "ec2:*Network*"
+              - "ec2:*Route*"
+              - "ec2:*SecurityGroup*"
+              - "ec2:*Snapshot*"
+              - "ec2:*Subnet*"
+              - "ec2:*Vpc*"
+              - "ec2:*Vpn*"
+              - "ec2:DeleteFleets"
+              - "ec2:ResetEbsDefaultKmsKeyId"
+              - "ec2:ReportInstanceStatus"
+              - "ec2:ImportKeyPair"
+              - "ec2:StopInstances"
+              - "ec2:ProvisionByoipCidr"
+              - "ec2:WithdrawByoipCidr"
+              - "ec2:AssociateDhcpOptions"
+              - "ec2:ConfirmProductInstance"
+              - "ec2:ConfirmProductInstance"
+              - "ec2:ModifyFpgaImageAttribute"
+              - "ec2:EnableEbsEncryptionByDefault"
+              - "ec2:SendDiagnosticInterrupt"
+              - "ec2:AssociateIamInstanceProfile"
+              - "ec2:ReplaceIamInstanceProfileAssociation"
+              - "ec2:CreateDhcpOptions"
+              - "ec2:DeleteDhcpOptions"
+              - "ec2:CreateKeyPair"
+              - "ec2:DeleteKeyPair"
+              - "ec2:BundleInstance"
+              - "ec2:CreateTags"
+              - "ec2:DisassociateIamInstanceProfile"
+              - "ec2:AttachVolume"
+              - "ec2:CreateInstanceExportTask"
+              - "ec2:MonitorInstances"
+              - "ec2:UnmonitorInstances"
+              - "ec2:DetachVolume"
+              - "ec2:DeleteVolume"
+              - "ec2:DeleteLaunchTemplate*"
+              - "ec2:CreateFlowLogs"
+              - "ec2:DeleteFlowLogs"
+              - "ec2:ModifyIdentityIdFormat"
+              - "ec2:ModifyIdFormat"
+              - "ec2:AdvertiseByoipCidr"
+              - "ec2:DeprovisionByoipCidr"
+              - "ec2:DeleteTags"
+              - "ec2:TerminateInstances"
+              - "ec2:DisableEbsEncryptionByDefault"
+              - "ec2:ModifyEbsDefaultKmsKeyId"
+              - "events:Describe*"
+              - "events:List*"
+              - "events:TestEventPattern"
+              - "iam:List*"
+              - "iam:Get*"
+              - "logs:List*"
+              - "logs:Describe*"
+              - "logs:Get*"
+              - "logs:StartQuery"
+              - "logs:StopQuery"
+              - "logs:TestMetricFilter"
+              - "logs:FilterLogEvents"
+              - "resource-groups:Get*"
+              - "resource-groups:List*"
+              - "resource-groups:SearchResources"
+              - "ssm:List*"
+              - "ssm:Describe*"
+              - "ssm:Get*"
+              - "ssm:PutInventory"
+              - "ssm:PutComplianceItems"
+              - "ssm:PutConfigurePackageResult"
+              - "ssm:UpdateAssociationStatus"
+              - "ssm:UpdateInstanceAssociationStatus"
+              - "ssm:UpdateInstanceInformation"
+              - "ssm:CancelCommand"
+              - "ssm:SendCommand"
+              - "ssm:StartAutomationExecution"
+              - "ssm:StartSession"
+              - "ssm:TerminateSession"
+              - "ssm:ResumeSession"
+              - "ssm:DescribeSessions"
+              - "ssm:GetConnectionStatus"
+              - "sns:ListTopics"
+              - "tag:*"
+              - "cloudtrail:LookupEvents"
+            Effect: Allow
+            Resource: "*"
+          - Sid: RestrictRDSActivity
+            Effect: Allow
+            Action:
+              - "rds:CreateDBInstance"
+              - "rds:CreateDBInstanceReadReplica"
+              - "rds:StartDBInstance"
+              - "rds:ModifyDBInstance"
+              - "rds:RebootDBInstance"
+              - "rds:RestoreDBInstanceFromDBSnapshot"
+              - "rds:RestoreDBInstanceFromS3"
+              - "rds:RestoreDBInstanceToPointInTime"
+              - "rds:CreateDBCluster"
+              - "rds:StartDBCluster"
+              - "rds:ModifyDBCluster"
+              - "rds:CreateGlobalCluster"
+              - "rds:ModifyDBClusterEndpoint"
+              - "rds:ModifyGlobalCluster"
+              - "rds:RestoreDBClusterFromS3"
+              - "rds:RestoreDBClusterFromSnapshot"
+              - "rds:ModifyCurrentDBClusterCapacity"
+              - "rds:PromoteReadReplicaDBCluster"
+            Resource: "*"
+            Condition:
+              "ForAnyValue:StringLikeIfExists":
+                "rds:DatabaseEngine":
+                  - aurora-mysql
+                  - aurora-postgresql
+                  - mysql
+                  - postgres
+                  - mariadb
+                "rds:DatabaseClass":
+                  - "*.nano"
+                  - "*.micro"
+                  - "*.small"
+                  - "*.medium"
+              NumericLessThanIfExists:
+                "rds:StorageSize": "101"
+              NumericEqualsIfExists:
+                "rds:Piops": "0"
+              BoolIfExists:
+                "rds:MultiAz":
+                  - false
+          - Sid: AllowServiceLinkedRoleCreation
+            Effect: Allow
+            Action: "iam:CreateServiceLinkedRole"
+            Resource: "arn:aws:iam::*:role/aws-service-role/*"
+          - Sid: RDSRoleAndPolicies
+            Effect: Allow
+            Action:
+              - "iam:AttachRolePolicy"
+              - "iam:CreateInstanceProfile"
+              - "iam:DetachRolePolicy"
+              - "iam:PassRole"
+            Resource: "*"
+            Condition:
+              StringLikeIfExists:
+                "iam:AWSServiceName": rds.amazonaws.com
+                "iam:PassedToService": rds.amazonaws.com
+          - Sid: RestrictInstanceActions
+            Effect: Allow
+            Action:
+              - "ec2:CreateVolume"
+              - "ec2:ModifyVolume"
+              - "ec2:ImportVolume"
+              - "ec2:ModifyVolumeAttribute"
+              - "ec2:ModifyFleet"
+              - "ec2:ImportSnapshot"
+              - "ec2:ResetInstanceAttribute"
+              - "ec2:CreateFleet"
+              - "ec2:CreateLaunchTemplateVersion"
+              - "ec2:EnableVolumeIO"
+              - "ec2:CreateLaunchTemplate"
+              - "ec2:ImportInstance"
+              - "ec2:ModifyInstanceCreditSpecification"
+              - "ec2:ModifyLaunchTemplate"
+              - "ec2:ModifyInstanceAttribute"
+              - "ec2:RebootInstances"
+              - "ec2:RunInstances"
+              - "ec2:StartInstances"
+            Resource: "*"
+            Condition:
+              StringEqualsIfExists:
+                "ec2:Owner": amazon
+              "ForAllValues:StringLikeIfExists":
+                "ec2:InstanceType":
+                  - "*.nano"
+                  - "*.micro"
+                  - "*.small"
+                "ec2:Tenancy": default
+              StringNotEqualsIfExists:
+                "ec2:PlacementGroupStrategy": cluster
+              StringNotEqualsIgnoreCaseIfExists:
+                "ec2:VolumeType":
+                  - io1
+                  - st1
+              NumericLessThanEqualsIfExists:
+                "ec2:VolumeSize": "51"
+          - Sid: RestrictActions
+            Effect: Deny
+            Action:
+              - "ec2:*Spot*"
+              - "ec2:*ReservedInstances*"
+              - "ec2:*Scheduled*"
+              - "ec2:*Purchase*"
+              - "ec2:EnableFastSnapshotRestores"
+              - "rds:PurchaseReservedDBInstancesOffering"
+            Resource: "*"
+          - Sid: RestrictCloud9
+            Effect: Deny
+            Action:
+              - "cloud9:CreateEnvironmentEC2"
+              - "cloud9:UpdateEnvironment"
+            Resource: "*"
+            Condition:
+              "ForAnyValue:StringNotLikeIfExists":
+                "cloud9:InstanceType":
+                  - "*.nano"
+                  - "*.micro"
+                  - "*.small"
+      ManagedPolicyName: lab_policy
+      Users:
+        - awsstudent
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 0762e2a6-2b85-4fc7-b417-719bdaba5e59
+  IAMUserAccessKey:
+    Type: "AWS::IAM::AccessKey"
+    DependsOn: IAMUser
+    Properties:
+      Status: Active
+      UserName: awsstudent
+    Metadata:
+      "AWS::CloudFormation::Designer":
+        id: 14791b76-eb09-4de2-82f0-ebf7f9aacea4
+Metadata:
+  "AWS::CloudFormation::Designer":
+    de807de2-3002-4667-9edc-bcc467cd4b8e:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 570
+        "y": 300
+      z: 1
+      embeds: []
+    14791b76-eb09-4de2-82f0-ebf7f9aacea4:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 570
+        "y": 420
+      z: 1
+      embeds: []
+      dependson:
+        - de807de2-3002-4667-9edc-bcc467cd4b8e
+    0762e2a6-2b85-4fc7-b417-719bdaba5e59:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 270
+        "y": 510
+      z: 1
+      embeds: []
+      dependson:
+        - de807de2-3002-4667-9edc-bcc467cd4b8e
+    22b9f368-1e47-406f-980b-4392b7550951:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 360
+        "y": 510
+      z: 1
+      embeds: []
+    59ba589b-9df9-42b2-bb47-336eee35ba37:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 450
+        "y": 510
+      z: 1
+      embeds: []
+    964ce047-2ca1-42c1-8962-e2ea7438a7f0:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 540
+        "y": 510
+      z: 1
+      embeds: []
+    cc2fe389-6dc8-41cf-b6a3-6a304e00bce2:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 70
+        "y": 510
+      z: 1
+      embeds: []
+    aa9e7ebf-5639-42d3-acc2-e5bab4e26f44:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 180
+        "y": 510
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - cc2fe389-6dc8-41cf-b6a3-6a304e00bce2
+    1267aae2-fb77-4f82-bbc9-b1786df576e3:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 60
+        "y": 90
+      z: 1
+      embeds:
+        - dd878f45-1ad4-4a89-9299-978cd7b778c0
+    dd878f45-1ad4-4a89-9299-978cd7b778c0:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 90
+        "y": 150
+      z: 2
+      parent: 1267aae2-fb77-4f82-bbc9-b1786df576e3
+      embeds: []
+      dependson:
+        - 1267aae2-fb77-4f82-bbc9-b1786df576e3
+    22d8c95a-501c-4037-a2bf-3bc6dbcd2ea7:
+      size:
+        width: 120
+        height: 160
+      position:
+        x: 490
+        "y": 100
+      z: 1
+      embeds: []
+    2963d6db-c372-4bc8-91e5-f9b2a11df503:
+      size:
+        width: 140
+        height: 90
+      position:
+        x: 70
+        "y": 390
+      z: 1
+      embeds: []
+    35b8d1b5-c8d7-4af8-b1a8-927cb0e2e4c6:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 360
+        "y": 300
+      z: 1
+      embeds: []
+      iscontainedinside:
+        - 2963d6db-c372-4bc8-91e5-f9b2a11df503
+        - 22d8c95a-501c-4037-a2bf-3bc6dbcd2ea7
+    4f2cdef7-bebc-4358-800e-ca8aec1f2052:
+      size:
+        width: 110
+        height: 140
+      position:
+        x: 360
+        "y": 100
+      z: 1
+      embeds: []
